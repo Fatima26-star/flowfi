@@ -1,6 +1,5 @@
 "use client";
 import React, { useState } from "react";
-import { hasValidPrecision } from "@/utils/amount";
 import { useModalDialog } from "@/hooks/useModalDialog";
 import { logger } from "@/lib/logger";
 import { Stepper } from "../ui/Stepper";
@@ -9,85 +8,27 @@ import { RecipientStep } from "./RecipientStep";
 import { TokenStep } from "./TokenStep";
 import { AmountStep } from "./AmountStep";
 import { ScheduleStep } from "./ScheduleStep";
-import { TemplateStep, type StreamTemplate } from "./TemplateStep";
-import { fetchTokenBalanceDisplay } from "@/lib/soroban";
-import { isValidStellarPublicKey } from "@/lib/stellar";
-import toast from "react-hot-toast";
+import { TemplateStep } from "./TemplateStep";
+import { transactionSuccessToast } from "@/lib/transaction-feedback";
 import { useRouter } from "next/navigation";
 import { getApiBaseUrl } from "@/lib/api/_shared";
+import { MultisigRequiredError, toBaseUnits } from "@/lib/soroban";
+import type { MultisigRoutingResult } from "@/lib/stellar-multisig";
+import { MultisigSignModal } from "../wallet/MultisigSignModal";
+import {
+  useStreamForm,
+  type StreamFormData,
+} from "@/hooks/useStreamForm";
+import { validateAmount } from "@/lib/stream-validation";
 
-export interface StreamFormData {
-  recipient: string;
-  token: string;
-  amount: string;
-  duration: string;
-  durationUnit: "seconds" | "minutes" | "hours" | "days" | "weeks" | "months";
-  descriptionTag?: string;
-}
+// Re-export StreamFormData so existing imports keep working
+export type { StreamFormData };
 
 interface StreamCreationWizardProps {
   onClose: () => void;
-  onSubmit: (data: StreamFormData) => Promise<void>;
+  onSubmit: (data: StreamFormData) => Promise<{ txHash: string }>;
   walletPublicKey?: string;
 }
-
-// Unified storage key shared with dashboard form (Issue #699)
-const CUSTOM_TEMPLATE_STORAGE_KEY = "flowfi.stream.templates.v1";
-
-const BUILT_IN_TEMPLATES: StreamTemplate[] = [
-  {
-    id: "monthly-salary",
-    name: "Monthly Salary",
-    description: "Recurring monthly payroll stream",
-    builtIn: true,
-    values: {
-      token: "USDC",
-      amount: "5000",
-      duration: "1",
-      durationUnit: "months",
-      descriptionTag: "salary",
-    },
-  },
-  {
-    id: "weekly-subscription",
-    name: "Weekly Subscription",
-    description: "Weekly recurring subscription billing",
-    builtIn: true,
-    values: {
-      token: "USDC",
-      amount: "49",
-      duration: "1",
-      durationUnit: "weeks",
-      descriptionTag: "subscription",
-    },
-  },
-  {
-    id: "one-time-grant",
-    name: "One-time Grant",
-    description: "Short fixed-duration grant payout",
-    builtIn: true,
-    values: {
-      token: "USDC",
-      amount: "1000",
-      duration: "14",
-      durationUnit: "days",
-      descriptionTag: "grant",
-    },
-  },
-  {
-    id: "custom",
-    name: "Custom",
-    description: "Start with blank defaults",
-    builtIn: true,
-    values: {
-      token: "USDC",
-      amount: "",
-      duration: "",
-      durationUnit: "days",
-      descriptionTag: "custom",
-    },
-  },
-];
 
 const STEPS = ["Template", "Recipient", "Token", "Amount", "Schedule"];
 
@@ -98,226 +39,85 @@ export const StreamCreationWizard: React.FC<StreamCreationWizardProps> = ({
 }) => {
   const [currentStep, setCurrentStep] = useState(1);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [customTemplates, setCustomTemplates] = useState<StreamTemplate[]>([]);
-  const [selectedTemplateId, setSelectedTemplateId] = useState("monthly-salary");
   const [customTemplateName, setCustomTemplateName] = useState("");
   const [templateSaveMessage, setTemplateSaveMessage] = useState<string | null>(null);
-  const [formData, setFormData] = useState<StreamFormData>({
-    recipient: "",
-    token: "USDC",
-    amount: "5000",
-    duration: "1",
-    durationUnit: "months",
-    descriptionTag: "salary",
-  });
-  const [errors, setErrors] = useState<Partial<Record<keyof StreamFormData, string>>>({});
-  
+
   // Tracking & Polling state (Issue #378)
   const [txHash, setTxHash] = useState<string | null>(null);
   const [isPolling, setIsPolling] = useState(false);
   const [timeoutError, setTimeoutError] = useState(false);
-  
+
+  // Multisig co-signing state (Issue #1471): populated when the wallet's
+  // signature is below the account's required signing weight.
+  const [multisigProposal, setMultisigProposal] = useState<{
+    xdr: string;
+    routing: MultisigRoutingResult;
+  } | null>(null);
+
   const router = useRouter();
 
-  const dialogRef = useModalDialog({ 
-    onClose,
-    isCloseDisabled: isSubmitting || isPolling
+  // ── Shared form hook (replaces ad-hoc validation + balance + templates) ──
+  const {
+    formData,
+    errors,
+    updateFormData,
+    validateStep,
+    walletBalance,
+    walletBalanceLoading,
+    walletBalanceError,
+    setMaxAmount,
+    allTemplates,
+    selectedTemplateId,
+    applyTemplate: applyTemplateHook,
+    saveCustomTemplate,
+  } = useStreamForm({
+    walletPublicKey,
+    initialData: {
+      token: "USDC",
+      amount: "5000",
+      duration: "1",
+      durationUnit: "months",
+      descriptionTag: "salary",
+    },
   });
 
-  const [walletBalance, setWalletBalance] = useState<string | null>(null);
-  const [walletBalanceLoading, setWalletBalanceLoading] = useState(false);
-  const [walletBalanceError, setWalletBalanceError] = useState<string | null>(null);
+  const dialogRef = useModalDialog({
+    onClose,
+    isCloseDisabled: isSubmitting || isPolling,
+  });
 
-  React.useEffect(() => {
-    let timer: NodeJS.Timeout;
-    try {
-      const stored = localStorage.getItem(CUSTOM_TEMPLATE_STORAGE_KEY);
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        if (Array.isArray(parsed)) {
-          const sanitized = parsed
-            .filter((item) => item && typeof item.id === "string" && typeof item.name === "string")
-            .map((item) => ({
-              id: item.id,
-              name: item.name,
-              description: item.description || "Saved custom template",
-              values: item.values || {},
-            } as StreamTemplate));
-          timer = setTimeout(() => {
-            setCustomTemplates(sanitized);
-          }, 0);
-        }
-      }
-    } catch {
-      timer = setTimeout(() => {
-        setCustomTemplates([]);
-      }, 0);
-    }
-    return () => {
-      if (timer) clearTimeout(timer);
-    };
-  }, []);
-
-  React.useEffect(() => {
-    try {
-      localStorage.setItem(CUSTOM_TEMPLATE_STORAGE_KEY, JSON.stringify(customTemplates));
-    } catch {
-      // ignore localStorage write errors
-    }
-  }, [customTemplates]);
-
-  React.useEffect(() => {
-    let cancelled = false;
-    let timer: NodeJS.Timeout;
-
-    if (!walletPublicKey || !formData.token) {
-      timer = setTimeout(() => {
-        setWalletBalance(null);
-        setWalletBalanceError(null);
-        setWalletBalanceLoading(false);
-      }, 0);
-      return () => clearTimeout(timer);
-    }
-
-    timer = setTimeout(() => {
-      setWalletBalanceLoading(true);
-      setWalletBalanceError(null);
-    }, 0);
-
-    fetchTokenBalanceDisplay(walletPublicKey, formData.token)
-      .then((balance) => {
-        if (cancelled) return;
-        setWalletBalance(balance);
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setWalletBalance(null);
-        setWalletBalanceError("Unable to fetch wallet balance right now.");
-      })
-      .finally(() => {
-        if (cancelled) return;
-        setWalletBalanceLoading(false);
-      });
-
-    return () => {
-      cancelled = true;
-      clearTimeout(timer);
-    };
-  }, [walletPublicKey, formData.token]);
-
-  const updateFormData = (updates: Partial<StreamFormData>) => {
-    setFormData((prev) => ({ ...prev, ...updates }));
-    // Clear errors for updated fields
-    setErrors((prev) => {
-      const newErrors = { ...prev };
-      Object.keys(updates).forEach((key) => {
-        delete newErrors[key as keyof StreamFormData];
-      });
-      return newErrors;
-    });
-  };
-
-  const allTemplates = React.useMemo(
-    () => [...BUILT_IN_TEMPLATES, ...customTemplates],
-    [customTemplates]
+  // Re-derive amount validity on every render — rather than only when "Next"
+  // is clicked — so the final submit stays disabled until the deposit amount is
+  // valid against the connected wallet's balance (issue #1507).
+  const amountError = validateAmount(
+    formData.amount,
+    walletBalance,
+    formData.token,
   );
+  const amountValid = amountError === null;
+  const canSubmit = !isSubmitting && amountValid;
 
-  const applyTemplate = (templateId: string) => {
-    const template = allTemplates.find((item) => item.id === templateId);
-    if (!template) return;
-    setSelectedTemplateId(templateId);
-    setTemplateSaveMessage(`Applied template "${template.name}". You can still edit every field.`);
-    updateFormData({
-      token: template.values.token ?? formData.token,
-      amount: template.values.amount ?? formData.amount,
-      duration: template.values.duration ?? formData.duration,
-      durationUnit: template.values.durationUnit ?? formData.durationUnit,
-      descriptionTag: template.values.descriptionTag ?? formData.descriptionTag,
-    });
+  const handleApplyTemplate = (templateId: string) => {
+    const msg = applyTemplateHook(templateId);
+    if (msg) setTemplateSaveMessage(msg);
   };
 
-  const saveCurrentAsCustomTemplate = () => {
-    const cleanedName = customTemplateName.trim();
-    if (!cleanedName) {
-      setTemplateSaveMessage("Enter a template name first.");
-      return;
+  const scrollToFirstError = () => {
+    // Scroll to first error if validation fails
+    const firstError = document.querySelector('[role="alert"]');
+    if (firstError) {
+      firstError.scrollIntoView({ behavior: "smooth", block: "center" });
     }
-
-    if (!formData.amount || !formData.duration || !formData.token) {
-      setTemplateSaveMessage("Set amount, duration, and token before saving a custom template.");
-      return;
-    }
-
-    const newTemplate: StreamTemplate = {
-      id: `custom-${Date.now()}`,
-      name: cleanedName,
-      description: formData.descriptionTag
-        ? `Tag: ${formData.descriptionTag}`
-        : "Saved custom template",
-      values: {
-        token: formData.token,
-        amount: formData.amount,
-        duration: formData.duration,
-        durationUnit: formData.durationUnit,
-        descriptionTag: formData.descriptionTag || "custom",
-      },
-    };
-
-    setCustomTemplates((prev) => [newTemplate, ...prev]);
-    setCustomTemplateName("");
-    setTemplateSaveMessage(`Saved custom template "${cleanedName}".`);
-    setSelectedTemplateId(newTemplate.id);
   };
 
-  const validateStep = (step: number): boolean => {
-    const newErrors: Partial<Record<keyof StreamFormData, string>> = {};
-
-    switch (step) {
-      case 1: // Template
-        break;
-      case 2: // Recipient
-        if (!formData.recipient.trim()) {
-          newErrors.recipient = "Recipient address is required";
-        } else if (!isValidStellarPublicKey(formData.recipient.trim())) {
-          newErrors.recipient = "Invalid Stellar public key format";
-        }
-        break;
-      case 3: // Token
-        if (!formData.token) {
-          newErrors.token = "Please select a token";
-        }
-        break;
-      case 4: // Amount
-        if (!formData.amount.trim()) {
-          newErrors.amount = "Amount is required";
-        } else {
-          const amount = parseFloat(formData.amount);
-          if (isNaN(amount) || amount <= 0) {
-            newErrors.amount = "Amount must be a positive number";
-          } else if (!hasValidPrecision(formData.amount, 7)) {
-            newErrors.amount = "Amount exceeds maximum precision (7 decimal places)";
-          } else if (walletBalance) {
-            const available = parseFloat(walletBalance);
-            if (!isNaN(available) && amount > available) {
-              newErrors.amount = "Amount exceeds wallet balance";
-            }
-          }
-        }
-        break;
-      case 5: // Schedule
-        if (!formData.duration.trim()) {
-          newErrors.duration = "Duration is required";
-        } else {
-          const duration = parseFloat(formData.duration);
-          if (isNaN(duration) || duration <= 0) {
-            newErrors.duration = "Duration must be a positive number";
-          }
-        }
-        break;
+  const handleSaveCustomTemplate = () => {
+    const errorMsg = saveCustomTemplate(customTemplateName);
+    if (errorMsg) {
+      setTemplateSaveMessage(errorMsg);
+    } else {
+      setTemplateSaveMessage(`Saved custom template "${customTemplateName.trim()}".`);
+      setCustomTemplateName("");
     }
-
-    setErrors(newErrors);
-    return Object.keys(newErrors).length === 0;
   };
 
   const handleNext = () => {
@@ -331,11 +131,7 @@ export const StreamCreationWizard: React.FC<StreamCreationWizardProps> = ({
         }
       }
     } else {
-      // Scroll to first error if validation fails
-      const firstError = document.querySelector('[role="alert"]');
-      if (firstError) {
-        firstError.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      }
+      scrollToFirstError();
     }
   };
 
@@ -349,24 +145,50 @@ export const StreamCreationWizard: React.FC<StreamCreationWizardProps> = ({
     }
   };
 
-  const startPolling = async (senderAddress: string) => {
+  const startPolling = async (senderAddress: string, form: StreamFormData) => {
     const startTime = Date.now();
     const TIMEOUT_MS = 30000; // 30 seconds
     const POLL_INTERVAL = 2000; // 2 seconds
     const baseUrl = getApiBaseUrl();
 
+    // Identify the stream the user just created instead of assuming the API's
+    // first result is it (issue #1204). We match on the submitted recipient and
+    // deposit amount, then prefer the most recently created match.
+    const expectedRecipient = form.recipient.trim().toLowerCase();
+    const expectedDeposit = toBaseUnits(form.amount);
+
     while (Date.now() - startTime < TIMEOUT_MS) {
       try {
         const response = await fetch(`${baseUrl}/v1/streams?sender=${senderAddress}`);
         const payload = await response.json();
-        const streams = Array.isArray(payload) ? payload : (payload.data ?? []);
-        
-        // Assuming the latest stream is what we want
-        if (streams && streams.length > 0) {
-          // Found!
-          const newStream = streams[0]; // Simplification
-          toast.success("Stream indexed and confirmed!");
-          router.push(`/streams/${newStream.streamId}`); // Updated path to match new structure
+        const streams: Array<Record<string, unknown>> = Array.isArray(payload)
+          ? payload
+          : (payload.data ?? []);
+
+        const candidates = streams.filter((stream) => {
+          if (typeof stream.recipient !== "string") return false;
+          if (stream.recipient.toLowerCase() !== expectedRecipient) return false;
+          // depositedAmount is stored in base units. Streams surfaced from the
+          // live RPC fallback may omit it, in which case recipient + recency
+          // decides the match.
+          if (typeof stream.depositedAmount === "string") {
+            try {
+              return BigInt(stream.depositedAmount) === expectedDeposit;
+            } catch {
+              return false;
+            }
+          }
+          return true;
+        });
+
+        if (candidates.length > 0) {
+          const newStream = candidates.reduce((latest, stream) => {
+            const latestTime = Date.parse(String(latest.createdAt)) || 0;
+            const streamTime = Date.parse(String(stream.createdAt)) || 0;
+            return streamTime > latestTime ? stream : latest;
+          });
+          transactionSuccessToast("Stream indexed and confirmed!");
+          router.push(`/streams/${String(newStream.streamId)}`);
           return;
         }
       } catch (e) {
@@ -380,28 +202,41 @@ export const StreamCreationWizard: React.FC<StreamCreationWizardProps> = ({
   };
 
   const handleSubmit = async () => {
+    // Authoritative pre-submission wallet balance check (issue #1507): the
+    // balance may have finished loading after the user advanced past the
+    // amount step, so re-validate it here and send the user back if needed.
+    if (!validateStep(4)) {
+      setCurrentStep(4);
+      scrollToFirstError();
+      return;
+    }
+
     if (validateStep(currentStep)) {
       setIsSubmitting(true);
       try {
         // Step 1: Submit transaction
-        const result = (await onSubmit(formData)) as unknown as { txHash: string };
-        const hash = result?.txHash;
-        setTxHash(hash);
+        const result = await onSubmit(formData);
+        setTxHash(result.txHash);
         
         // Step 2: Start Polling for Indexer
         setIsPolling(true);
-        await startPolling(walletPublicKey || "");
+        await startPolling(walletPublicKey || "", formData);
         
       } catch (error) {
+        // Multisig accounts: instead of surfacing a raw broadcast failure,
+        // hand the partial envelope to the co-signing coordinator.
+        if (error instanceof MultisigRequiredError) {
+          logger.info("Multisig co-signing required; opening proposal flow.");
+          setMultisigProposal({ xdr: error.signedXdr, routing: error.routing });
+          setIsSubmitting(false);
+          return;
+        }
+
         logger.error("Failed to create stream:", error);
         setIsSubmitting(false);
       }
     } else {
-      // Scroll to first error if validation fails
-      const firstError = document.querySelector('[role="alert"]');
-      if (firstError) {
-        firstError.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      }
+      scrollToFirstError();
     }
   };
 
@@ -411,11 +246,11 @@ export const StreamCreationWizard: React.FC<StreamCreationWizardProps> = ({
         return (
           <TemplateStep
             templates={allTemplates}
-            selectedTemplateId={selectedTemplateId}
-            onSelectTemplate={applyTemplate}
+            selectedTemplateId={selectedTemplateId ?? "monthly-salary"}
+            onSelectTemplate={handleApplyTemplate}
             customTemplateName={customTemplateName}
             onCustomTemplateNameChange={setCustomTemplateName}
-            onSaveCustomTemplate={saveCurrentAsCustomTemplate}
+            onSaveCustomTemplate={handleSaveCustomTemplate}
             saveDisabled={isSubmitting}
             saveMessage={templateSaveMessage}
           />
@@ -446,22 +281,15 @@ export const StreamCreationWizard: React.FC<StreamCreationWizardProps> = ({
             availableBalance={walletBalance}
             isBalanceLoading={walletBalanceLoading}
             balanceError={walletBalanceError}
-            onSetMax={() => {
-              if (!walletBalance) return;
-              updateFormData({ amount: walletBalance });
-            }}
+            onSetMax={setMaxAmount}
           />
         );
       case 5:
         return (
           <ScheduleStep
-            duration={formData.duration}
-            durationUnit={formData.durationUnit}
-            onDurationChange={(value) => updateFormData({ duration: value })}
-            onUnitChange={(value) => updateFormData({ durationUnit: value })}
-            error={errors.duration}
-            amount={formData.amount}
-            token={formData.token}
+            formData={formData}
+            errors={errors}
+            onUpdate={updateFormData}
           />
         );
       default:
@@ -470,6 +298,7 @@ export const StreamCreationWizard: React.FC<StreamCreationWizardProps> = ({
   };
 
   return (
+    <>
     <div 
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
       role="dialog"
@@ -545,7 +374,7 @@ export const StreamCreationWizard: React.FC<StreamCreationWizardProps> = ({
                       </div>
                     </div>
                     <div className="flex items-center gap-4">
-                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border-2 border-accent animate-pulse">
+                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border-2 border-accent motion-reduce:animate-none">
                         <div className="h-2 w-2 rounded-full bg-accent" />
                       </div>
                       <div className="flex-1">
@@ -556,9 +385,9 @@ export const StreamCreationWizard: React.FC<StreamCreationWizardProps> = ({
                   </div>
                   <div className="mt-12 flex flex-col items-center gap-2">
                     <div className="flex gap-1">
-                      <div className="w-2 h-2 rounded-full bg-accent animate-bounce" style={{ animationDelay: "0s" }} />
-                      <div className="w-2 h-2 rounded-full bg-accent animate-bounce" style={{ animationDelay: "0.2s" }} />
-                      <div className="w-2 h-2 rounded-full bg-accent animate-bounce" style={{ animationDelay: "0.4s" }} />
+                      <div className="w-2 h-2 rounded-full bg-accent motion-reduce:animate-none" style={{ animationDelay: "0s" }} />
+                      <div className="w-2 h-2 rounded-full bg-accent motion-reduce:animate-none" style={{ animationDelay: "0.2s" }} />
+                      <div className="w-2 h-2 rounded-full bg-accent motion-reduce:animate-none" style={{ animationDelay: "0.4s" }} />
                     </div>
                     <p className="text-sm text-slate-400">This usually takes 5-10 seconds</p>
                   </div>
@@ -618,37 +447,63 @@ export const StreamCreationWizard: React.FC<StreamCreationWizardProps> = ({
         </div>
 
         {!isPolling && (
-          <div className="flex justify-between gap-4 pt-6 border-t border-glass-border">
-            <div>
-              {currentStep > 1 && (
-                <Button variant="outline" onClick={handleBack}>
-                  <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-                  </svg>
-                  Back
+          <>
+            {currentStep === STEPS.length && !amountValid && (
+              <p className="pt-6 text-sm text-red-400" role="alert">
+                {amountError}
+              </p>
+            )}
+            <div className="flex justify-between gap-4 pt-6 border-t border-glass-border">
+              <div>
+                {currentStep > 1 && (
+                  <Button variant="outline" onClick={handleBack}>
+                    <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+                    </svg>
+                    Back
+                  </Button>
+                )}
+              </div>
+              <div className="flex gap-4">
+                <Button variant="outline" onClick={onClose} disabled={isSubmitting || isPolling}>
+                  Cancel
                 </Button>
-              )}
+                {currentStep < STEPS.length ? (
+                  <Button onClick={handleNext}>
+                    Next
+                    <svg className="w-4 h-4 ml-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                    </svg>
+                  </Button>
+                ) : (
+                  <Button
+                    loading={isSubmitting}
+                    onClick={handleSubmit}
+                    disabled={!canSubmit}
+                  >
+                    Create Stream
+                  </Button>
+                )}
+              </div>
             </div>
-            <div className="flex gap-4">
-              <Button variant="outline" onClick={onClose} disabled={isSubmitting || isPolling}>
-                Cancel
-              </Button>
-              {currentStep < STEPS.length ? (
-                <Button onClick={handleNext}>
-                  Next
-                  <svg className="w-4 h-4 ml-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-                  </svg>
-                </Button>
-              ) : (
-                <Button loading={isSubmitting} onClick={handleSubmit}>
-                  Create Stream
-                </Button>
-              )}
-            </div>
-          </div>
+          </>
         )}
       </div>
     </div>
+
+    {multisigProposal && (
+      <MultisigSignModal
+        account={multisigProposal.routing.account}
+        initialXdr={multisigProposal.xdr}
+        onClose={() => setMultisigProposal(null)}
+        onSubmitted={(hash) => {
+          setMultisigProposal(null);
+          setTxHash(hash);
+          setIsPolling(true);
+          void startPolling(walletPublicKey || "", formData);
+        }}
+      />
+    )}
+    </>
   );
 };

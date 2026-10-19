@@ -4,26 +4,17 @@ import { subscribe } from '../../controllers/sse.controller.js';
 import { sseService } from '../../services/sse.service.js';
 import { requireAdmin, requireAuth } from '../../middleware/auth.js';
 import type { AuthenticatedRequest } from '../../types/auth.types.js';
-import { prisma } from '../../lib/prisma.js';
 import logger from '../../logger.js';
+import {
+  DEFAULT_EVENTS_PAGE_SIZE,
+  MAX_EVENTS_PAGE_SIZE,
+  listEventsForWallet,
+  parseEventTypeFilter,
+} from '../../repositories/streamEvent.repository.js';
+import { parsePagination } from '../../validators/stream.validator.js';
+import { isSandboxRequest } from '../../middleware/sandbox.middleware.js';
 
 const router = Router();
-
-const EVENT_TYPES = new Set([
-  'CREATED',
-  'TOPPED_UP',
-  'WITHDRAWN',
-  'CANCELLED',
-  'COMPLETED',
-  'PAUSED',
-  'RESUMED',
-  'FEE_COLLECTED',
-  'FEE_CONFIG_UPDATED',
-  'ADMIN_TRANSFERRED',
-]);
-
-export const MAX_EVENTS_PAGE_SIZE = 200;
-export const DEFAULT_EVENTS_PAGE_SIZE = 50;
 
 /**
  * @openapi
@@ -48,7 +39,7 @@ export const DEFAULT_EVENTS_PAGE_SIZE = 50;
  *         description: |
  *           Comma-separated list of event types to include. Allowed values:
  *           CREATED, TOPPED_UP, WITHDRAWN, CANCELLED, COMPLETED, PAUSED,
- *           RESUMED, FEE_COLLECTED.
+ *           RESUMED, FEE_COLLECTED, FEE_CONFIG_UPDATED, ADMIN_TRANSFERRED.
  *       - in: query
  *         name: limit
  *         required: false
@@ -62,9 +53,42 @@ export const DEFAULT_EVENTS_PAGE_SIZE = 50;
  *         required: false
  *         schema: { type: integer, default: 1 }
  *         description: Optional 1-based page index. Ignored when offset is set.
+ *       - in: query
+ *         name: includeStream
+ *         required: false
+ *         schema: { type: boolean, default: false }
+ *         description: When true, each event includes its related `stream`.
  *     responses:
  *       200:
  *         description: Paginated event list
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/EventListResponse'
+ *       400:
+ *         description: Missing/invalid `address` or invalid `type` filter
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       401:
+ *         description: Unauthorized - missing or invalid authentication token
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       403:
+ *         description: Forbidden - `address` must match the authenticated wallet
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       500:
+ *         description: Internal server error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  */
 router.get('/', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -81,58 +105,59 @@ router.get('/', requireAuth, async (req: Request, res: Response, next: NextFunct
       return;
     }
 
-    const rawType = typeof req.query.type === 'string' ? req.query.type : '';
-    const requested = rawType
-      .split(',')
-      .map((t) => t.trim().toUpperCase())
-      .filter(Boolean);
-    const types = requested.filter((t) => EVENT_TYPES.has(t));
+    const { requested, types } = parseEventTypeFilter(req.query.type);
     if (requested.length > 0 && types.length === 0) {
       res.status(400).json({ error: 'No valid event types in `type` filter' });
       return;
     }
 
-    const parsedLimit = Number.parseInt(String(req.query.limit ?? ''), 10);
-    const limit = Number.isFinite(parsedLimit) && parsedLimit > 0
-      ? Math.min(parsedLimit, MAX_EVENTS_PAGE_SIZE)
-      : DEFAULT_EVENTS_PAGE_SIZE;
-
-    const hasOffset = req.query.offset !== undefined;
-    const parsedOffset = Number.parseInt(String(req.query.offset ?? ''), 10);
-    const parsedPage = Number.parseInt(String(req.query.page ?? ''), 10);
-    const page = Number.isFinite(parsedPage) && parsedPage > 0 ? parsedPage : 1;
-    const offset = hasOffset && Number.isFinite(parsedOffset) && parsedOffset >= 0
-      ? parsedOffset
-      : (page - 1) * limit;
-
-    const where: {
-      stream: { OR: Array<{ sender: string } | { recipient: string }> };
-      eventType?: { in: string[] };
-    } = {
-      stream: {
-        OR: [{ sender: address }, { recipient: address }],
-      },
-    };
-    if (types.length > 0) {
-      where.eventType = { in: types };
+    const pagination = parsePagination(req.query as Record<string, unknown>, {
+      defaultLimit: DEFAULT_EVENTS_PAGE_SIZE,
+      maxLimit: MAX_EVENTS_PAGE_SIZE,
+    });
+    if (!pagination.ok) {
+      res.status(400).json({ error: pagination.message });
+      return;
     }
+    const { limit, offset } = pagination;
+    const includeStream = req.query.includeStream === 'true';
 
-    const [events, total] = await Promise.all([
-      prisma.streamEvent.findMany({
-        where,
-        orderBy: { timestamp: 'desc' },
-        skip: offset,
-        take: limit,
-      }),
-      prisma.streamEvent.count({ where }),
-    ]);
+    const isSandbox = isSandboxRequest(req);
+
+    const result = await listEventsForWallet({
+      address,
+      types,
+      limit,
+      offset,
+      includeStream,
+    });
+
+    // In sandbox mode, clearly mark every returned event so callers can tell
+    // test data apart from production records (issue #1535). Malformed
+    // metadata must never throw — fall back to an empty object.
+    const events = isSandbox
+      ? (result.events as Array<Record<string, unknown>>).map((event) => {
+          let metadata: Record<string, unknown> = {};
+          if (typeof event.metadata === 'string' && event.metadata) {
+            try {
+              const parsed = JSON.parse(event.metadata);
+              if (parsed && typeof parsed === 'object') {
+                metadata = parsed as Record<string, unknown>;
+              }
+            } catch {
+              metadata = {};
+            }
+          }
+          return { ...event, metadata: JSON.stringify({ ...metadata, _sandbox: true }) };
+        })
+      : result.events;
 
     res.json({
       events,
-      total,
-      limit,
-      offset,
-      hasMore: offset + events.length < total,
+      total: result.total,
+      limit: result.limit,
+      offset: result.offset,
+      hasMore: result.hasMore,
     });
   } catch (err) {
     logger.error('GET /v1/events failed:', err);
@@ -164,8 +189,10 @@ router.get('/', requireAuth, async (req: Request, res: Response, next: NextFunct
  *       
  *       **Sandbox Mode:**
  *       - Add header `X-Sandbox-Mode: true` or query parameter `?sandbox=true`
- *       - Sandbox events are clearly marked with `_sandbox` metadata
- *       - Sandbox events are isolated from production events
+ *       - The `connected` frame and every event delivered to a sandbox
+ *         connection are tagged with `_sandbox: true`
+ *       - Sandbox mode labels/tags events; it does not route to a separate
+ *         datastore or otherwise isolate stored data
  *     parameters:
  *       - in: header
  *         name: X-Sandbox-Mode
@@ -205,13 +232,16 @@ router.get('/', requireAuth, async (req: Request, res: Response, next: NextFunct
  *         example: false
  *     responses:
  *       200:
- *         description: SSE connection established
+ *         description: SSE connection established. Events are emitted as `data:` frames of type stream.created, stream.topped_up, stream.withdrawn, stream.cancelled, stream.completed, stream.paused, stream.resumed, fee.collected.
  *         content:
  *           text/event-stream:
  *             schema:
  *               type: string
+ *               description: Server-Sent Events stream; each event carries a JSON payload matching the StreamEvent schema
  *       400:
  *         description: Invalid subscription parameters
+ *       401:
+ *         description: Unauthorized - missing or invalid authentication token
  */
 router.get('/subscribe', requireAuth, subscribe);
 
@@ -222,30 +252,34 @@ router.get('/subscribe', requireAuth, subscribe);
  *     tags:
  *       - Events
  *     summary: Get SSE connection statistics
- *     description: Returns current SSE connection metrics for monitoring
+ *     description: Returns current SSE connection metrics for monitoring (admin only)
+ *     security:
+ *       - adminAuth: []
  *     responses:
  *       200:
  *         description: Connection statistics
  *         content:
  *           application/json:
  *             schema:
- *               type: object
- *               properties:
- *                 activeConnections:
- *                   type: number
- *                   example: 42
- *                 activeIps:
- *                   type: number
- *                   example: 8
- *                 perIpPeakConnections:
- *                   type: number
- *                   example: 5
- *                 maxConnections:
- *                   type: number
- *                   example: 10000
- *                 timestamp:
- *                   type: string
- *                   format: date-time
+ *               $ref: '#/components/schemas/SseStats'
+ *       401:
+ *         description: Unauthorized - missing or invalid authentication token
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       403:
+ *         description: Forbidden - admin access required
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       500:
+ *         description: Internal server error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  */
 router.get('/stats', requireAdmin, (req: Request, res: Response) => {
   res.json({

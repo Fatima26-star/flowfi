@@ -1,9 +1,10 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
-import { ClaimableAmountService } from '../src/services/claimable.service.js';
+import { ClaimableAmountService, calculateHistoricalStreamSnapshot } from '../src/services/claimable.service.js';
 
 function makeStreamState(overrides: Partial<Parameters<ClaimableAmountService['getClaimableAmount']>[0]> = {}) {
   return {
     streamId: 1n,
+    tokenAddress: 'TOKEN_DEFAULT',
     ratePerSecond: '10',
     depositedAmount: '100',
     withdrawnAmount: '0',
@@ -131,6 +132,40 @@ describe('ClaimableAmountService', () => {
     expect(third.cached).toBe(false);
   });
 
+  it('buckets the cache-key timestamp so requests within the same 5s window share an entry (Issue #1249)', () => {
+    vi.setSystemTime(5_000);
+    const service = new ClaimableAmountService({
+      cacheTtlMs: 60_000,
+    });
+
+    const input = makeStreamState({
+      streamId: 8n,
+      ratePerSecond: '10',
+      depositedAmount: '1000',
+      withdrawnAmount: '0',
+    });
+
+    // Second 5 and second 9 land in the same 5s bucket (5..9), so the second
+    // request must reuse the cached value instead of creating a new key.
+    const first = service.getClaimableAmount(input, 5);
+    expect(first.cached).toBe(false);
+    expect(first.calculatedAt).toBe(5);
+    expect(first.claimableAmount).toBe('50'); // 5s elapsed × 10/s
+
+    const sameBucket = service.getClaimableAmount(input, 9);
+    expect(sameBucket.cached).toBe(true);
+    // The cached payload reflects the second the value was computed at.
+    expect(sameBucket.calculatedAt).toBe(5);
+    expect(sameBucket.claimableAmount).toBe('50');
+
+    // Second 10 starts a new bucket, so a fresh calculation is performed
+    // (and the value reflects the extra elapsed second).
+    const nextBucket = service.getClaimableAmount(input, 10);
+    expect(nextBucket.cached).toBe(false);
+    expect(nextBucket.calculatedAt).toBe(10);
+    expect(nextBucket.claimableAmount).toBe('100'); // 10s elapsed × 10/s
+  });
+
   it('reflects an indexed withdrawal immediately, without waiting for the cache TTL', () => {
     // The cache key is derived from getStateFingerprint(), which folds in
     // withdrawnAmount and lastUpdateTime (see claimable.service.ts). When the
@@ -246,5 +281,136 @@ describe('ClaimableAmountService', () => {
       expect(claimable <= remaining, `iteration ${iteration}: claimable exceeded remaining`).toBe(true);
       expect(cancelRefund + withdrawn + claimable <= deposited, `iteration ${iteration}: cancel settlement exceeded deposit`).toBe(true);
     }
+  });
+
+  it('maintains independent cache entries for same streamId across different tokens', () => {
+    vi.setSystemTime(5_000);
+    const service = new ClaimableAmountService({
+      cacheTtlMs: 10_000,
+    });
+
+    // Two streams with the same numeric ID but different token contracts
+    const streamTokenA = makeStreamState({
+      streamId: 42n,
+      tokenAddress: 'TOKEN_A',
+      ratePerSecond: '10',
+      depositedAmount: '1000',
+      withdrawnAmount: '0',
+    });
+
+    const streamTokenB = makeStreamState({
+      streamId: 42n,
+      tokenAddress: 'TOKEN_B',
+      ratePerSecond: '5',
+      depositedAmount: '2000',
+      withdrawnAmount: '500',
+    });
+
+    const resultA = service.getClaimableAmount(streamTokenA, 100);
+    const resultB = service.getClaimableAmount(streamTokenB, 100);
+
+    // Both should be cache misses (different token = different cache key)
+    expect(resultA.cached).toBe(false);
+    expect(resultB.cached).toBe(false);
+
+    // The values should differ because the streams have different parameters
+    expect(resultA.claimableAmount).not.toBe(resultB.claimableAmount);
+
+    // Second call for Token A should be a cache hit
+    const resultA2 = service.getClaimableAmount(streamTokenA, 100);
+    expect(resultA2.cached).toBe(true);
+    expect(resultA2.claimableAmount).toBe(resultA.claimableAmount);
+
+    // Second call for Token B should also be a cache hit (independent of A)
+    const resultB2 = service.getClaimableAmount(streamTokenB, 100);
+    expect(resultB2.cached).toBe(true);
+    expect(resultB2.claimableAmount).toBe(resultB.claimableAmount);
+  });
+});
+
+describe('calculateHistoricalStreamSnapshot', () => {
+  const stream = { streamId: 42n, ratePerSecond: '2', startTime: 100 };
+  const event = (eventType: string, timestamp: number, amount: string | null = null, metadata: Record<string, unknown> = {}, ledgerSequence = timestamp) => ({
+    eventType, timestamp, amount, metadata: Object.keys(metadata).length ? JSON.stringify(metadata) : null, ledgerSequence,
+  });
+
+  it('replays creation, top-ups, withdrawals, and a completed pause interval', () => {
+    const snapshot = calculateHistoricalStreamSnapshot(stream, [
+      event('CREATED', 100, '500'),
+      event('TOPPED_UP', 200, '200', { newDepositedAmount: '700' }),
+      event('WITHDRAWN', 220, '150'),
+      event('PAUSED', 250, null, { pausedAt: '250' }),
+      event('RESUMED', 300, null, { pausedDuration: 50 }),
+    ], 350);
+
+    expect(snapshot).toEqual({
+      streamId: '42', timestamp: 350, depositedAmount: '700', withdrawnAmount: '150',
+      claimableAmount: '250', unvestedAmount: '300', statusAtTimestamp: 'ACTIVE',
+    });
+  });
+
+  it('freezes accrual while paused at the requested timestamp', () => {
+    const snapshot = calculateHistoricalStreamSnapshot(stream, [
+      event('CREATED', 100, '1000'),
+      event('WITHDRAWN', 120, '50'),
+      event('PAUSED', 200, null, { pausedAt: '200' }),
+    ], 260);
+
+    expect(snapshot.claimableAmount).toBe('150');
+    expect(snapshot.unvestedAmount).toBe('800');
+    expect(snapshot.statusAtTimestamp).toBe('PAUSED');
+  });
+
+  it('replays cancellation as a terminal state and preserves its cumulative withdrawn amount', () => {
+    const snapshot = calculateHistoricalStreamSnapshot(
+      { ...stream, ratePerSecond: '1' },
+      [
+        event('CREATED', 100, '1000'),
+        event('WITHDRAWN', 120, '25'),
+        event('CANCELLED', 150, '950', { amountWithdrawn: '50', refundedAmount: '950' }),
+      ],
+      300,
+    );
+
+    expect(snapshot).toEqual({
+      streamId: '42', timestamp: 300, depositedAmount: '1000', withdrawnAmount: '50',
+      claimableAmount: '0', unvestedAmount: '950', statusAtTimestamp: 'CANCELLED',
+    });
+  });
+
+  it('matches the live claimable calculation for a static active stream checkpoint', () => {
+    const timestamp = 150;
+    const snapshot = calculateHistoricalStreamSnapshot(
+      { streamId: 42n, ratePerSecond: '10', startTime: 100 },
+      [event('CREATED', 100, '1000')],
+      timestamp,
+    );
+    const simulatedClaimable = new ClaimableAmountService({ cacheTtlMs: 0 }).getClaimableAmount(
+      makeStreamState({ streamId: 42n, ratePerSecond: '10', depositedAmount: '1000', lastUpdateTime: 100 }),
+      timestamp,
+    );
+
+    expect(snapshot.claimableAmount).toBe(simulatedClaimable.claimableAmount);
+  });
+  it('caps completed vesting at the total deposit and honors cumulative withdrawals', () => {
+    const snapshot = calculateHistoricalStreamSnapshot(
+      { ...stream, ratePerSecond: '10' },
+      [event('CREATED', 100, '500'), event('COMPLETED', 200, '500')],
+      400,
+    );
+    expect(snapshot.claimableAmount).toBe('0');
+    expect(snapshot.unvestedAmount).toBe('0');
+    expect(snapshot.statusAtTimestamp).toBe('COMPLETED');
+  });
+
+  it('returns an empty not-started snapshot before the stream start', () => {
+    expect(calculateHistoricalStreamSnapshot(stream, [], 99)).toEqual({
+      streamId: '42', timestamp: 99, depositedAmount: '0', withdrawnAmount: '0',
+      claimableAmount: '0', unvestedAmount: '0', statusAtTimestamp: 'NOT_STARTED',
+    });
+  });
+
+  it('rejects snapshots when the creation event is missing', () => {
+    expect(() => calculateHistoricalStreamSnapshot(stream, [], 100)).toThrow(/creation event is missing/);
   });
 });

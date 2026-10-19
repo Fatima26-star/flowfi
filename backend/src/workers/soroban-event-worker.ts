@@ -3,18 +3,41 @@ import { rpc, xdr, StrKey } from "@stellar/stellar-sdk";
 import { prisma } from "../lib/prisma.js";
 import { INDEXER_STATE_ID, ensureIndexerState } from "../lib/indexer-state.js";
 import { sseService } from "../services/sse.service.js";
+import { sentinelService } from "../services/sentinel.service.js";
+import { publishIndexerLag, quarantineEvent } from "../services/indexerService.js";
+import {
+  indexerEventsProcessedTotal,
+  indexerPollsTotal,
+  recordRpcRequest,
+} from "../lib/metrics.js";
+import { withSpan } from "../lib/tracing.js";
 import logger, { requestContext } from "../logger.js";
 import { Prisma } from "../generated/prisma/index.js";
 import "../lib/stream-id.js";
-import { rpcPool } from "../lib/rpc-pool.js";
+import {
+  computeStateRootHash,
+  recordCheckpoint,
+  verifyAndRecover,
+  type LedgerHeader,
+} from "../services/checkpoint.service.js";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
+/** Ledger rollbacks above this ceiling are escalated to dead-letter triage. */
+const REORG_ALERT_THRESHOLD_DEFAULT = 5;
+
 // ─── XDR Decoding Helpers ────────────────────────────────────────────────────
 
+/** Use the ledger close time, not worker processing time, for historical state changes. */
+export function getEventLedgerTimestamp(event: Pick<rpc.Api.EventResponse, 'ledgerClosedAt'>): number {
+  const ledgerTimestamp = Number(event.ledgerClosedAt);
+  return Number.isSafeInteger(ledgerTimestamp) && ledgerTimestamp >= 0
+    ? ledgerTimestamp
+    : Math.floor(Date.now() / 1000);
+}
 /** Decode an ScVal symbol to a string. */
 export function decodeSymbol(val: xdr.ScVal): string {
-  return val.sym().toString();
+  return (val as xdr.ScValSymbol).sym.toString();
 }
 
 /**
@@ -22,12 +45,12 @@ export function decodeSymbol(val: xdr.ScVal): string {
  * `xdr.UInt64` extends Long; `.toString()` gives the decimal representation.
  */
 export function decodeU64(val: xdr.ScVal): bigint {
-  return BigInt(val.u64().toString());
+  return BigInt((val as xdr.ScValU64).u64.toString());
 }
 
 /** Decode an ScVal U32 to a JavaScript number. */
 export function decodeU32(val: xdr.ScVal): number {
-  return val.u32();
+  return (val as xdr.ScValU32).u32;
 }
 
 /**
@@ -36,9 +59,9 @@ export function decodeU32(val: xdr.ScVal): number {
  * Full value = hi * 2^64 + lo.
  */
 export function decodeI128(val: xdr.ScVal): string {
-  const parts = val.i128();
-  const hi = BigInt.asIntN(64, BigInt(parts.hi().toString()));
-  const lo = BigInt.asUintN(64, BigInt(parts.lo().toString()));
+  const parts = (val as xdr.ScValI128).i128;
+  const hi = BigInt.asIntN(64, BigInt(parts.hi.toString()));
+  const lo = BigInt.asUintN(64, BigInt(parts.lo.toString()));
   return ((hi << 64n) | lo).toString();
 }
 
@@ -47,13 +70,13 @@ export function decodeI128(val: xdr.ScVal): string {
  * string.
  */
 export function decodeAddress(val: xdr.ScVal): string {
-  const addr = val.address();
-  if (addr.switch().value === xdr.ScAddressType.scAddressTypeAccount().value) {
-    return StrKey.encodeEd25519PublicKey(addr.accountId().ed25519());
+  const addr = (val as xdr.ScValAddress).address;
+  if (addr.type === 'scAddressTypeAccount') {
+    return StrKey.encodeEd25519PublicKey((addr.accountId as xdr.PublicKeyEd25519).ed25519.value);
   }
-  // addr.contractId() returns a Hash (Opaque[]); cast to Uint8Array for encodeContract
-  const hash = addr.contractId();
-  return StrKey.encodeContract(Buffer.from(hash as unknown as Uint8Array));
+  // addr.contractId is a Hash (Opaque[]); cast to Uint8Array for encodeContract
+  const hash = (addr as xdr.ScAddressContract).contractId;
+  return StrKey.encodeContract(Buffer.from(hash.value as unknown as Uint8Array));
 }
 
 /**
@@ -62,10 +85,10 @@ export function decodeAddress(val: xdr.ScVal): string {
  */
 export function decodeMap(val: xdr.ScVal): Record<string, xdr.ScVal> {
   const result: Record<string, xdr.ScVal> = {};
-  const entries = val.map();
+  const entries = (val as xdr.ScValMap).map;
   if (!entries) return result;
   for (const entry of entries) {
-    result[entry.key().sym().toString()] = entry.val();
+    result[(entry.key as xdr.ScValSymbol).sym.toString()] = entry.val;
   }
   return result;
 }
@@ -94,6 +117,8 @@ export class SorobanEventWorker {
   private readonly server: rpc.Server;
   private readonly pollIntervalMs: number;
   private readonly startLedger: number;
+  /** Ledger rollbacks larger than this are escalated to dead-letter triage. */
+  private readonly reorgAlertThreshold: number;
 
   private isRunning = false;
   private pollTimer: NodeJS.Timeout | undefined;
@@ -116,13 +141,19 @@ export class SorobanEventWorker {
 
   constructor() {
     this.contractId = process.env.STREAM_CONTRACT_ID ?? "";
-    const rpcUrl = process.env.SOROBAN_RPC_URL ?? "https://soroban-testnet.stellar.org";
+    const rpcUrl =
+      process.env.SOROBAN_RPC_URL ?? "https://soroban-testnet.stellar.org";
     this.server = new rpc.Server(rpcUrl, { allowHttp: true });
     this.pollIntervalMs = parseInt(
       process.env.INDEXER_POLL_INTERVAL_MS ?? "5000",
       10,
     );
     this.startLedger = parseInt(process.env.INDEXER_START_LEDGER ?? "0", 10);
+    this.reorgAlertThreshold = parseInt(
+      process.env.INDEXER_REORG_ALERT_THRESHOLD ??
+        String(REORG_ALERT_THRESHOLD_DEFAULT),
+      10,
+    );
   }
 
   /**
@@ -205,16 +236,22 @@ export class SorobanEventWorker {
    */
   async triggerPoll(customRequestId?: string): Promise<string> {
     if (!this.isRunning) {
-      return customRequestId || requestContext?.getStore?.()?.requestId || randomUUID();
+      return (
+        customRequestId ||
+        requestContext?.getStore?.()?.requestId ||
+        randomUUID()
+      );
     }
 
     const requestId =
-      customRequestId || requestContext?.getStore?.()?.requestId || randomUUID();
+      customRequestId ||
+      requestContext?.getStore?.()?.requestId ||
+      randomUUID();
 
     try {
       await this.runExclusive(() => {
         const runBatch = () => this.fetchAndProcessEvents();
-        return requestContext && typeof requestContext.run === 'function'
+        return requestContext && typeof requestContext.run === "function"
           ? requestContext.run({ requestId }, runBatch)
           : runBatch();
       });
@@ -230,8 +267,11 @@ export class SorobanEventWorker {
   /**
    * Run `fn` exclusively with any other poll/replay batch.
    * Registers the work on `activeBatch` so `waitForDrain` awaits replays too.
+   *
+   * Public so that admin reset/replay paths can acquire the same lock,
+   * preventing a concurrent poll from overwriting the reset cursor (#1221).
    */
-  private runExclusive(fn: () => Promise<void>): Promise<void> {
+  runExclusive<T>(fn: () => Promise<T>): Promise<T> {
     const run = this.batchMutex.then(fn);
     // Keep the mutex chain alive even when a batch rejects.
     const gate = run.then(
@@ -292,7 +332,7 @@ export class SorobanEventWorker {
           this.fetchAndProcessEvents().catch((err) => {
             logger.error("[SorobanWorker] Unhandled error during poll:", err);
           });
-        return requestContext && typeof requestContext.run === 'function'
+        return requestContext && typeof requestContext.run === "function"
           ? requestContext.run({ requestId }, execute)
           : execute();
       });
@@ -306,16 +346,134 @@ export class SorobanEventWorker {
    * cursor (or start ledger on first run) and process each one in order.
    */
   private async fetchAndProcessEvents(): Promise<void> {
-    const currentCtx = requestContext?.getStore?.();
-    if (!currentCtx?.requestId && requestContext && typeof requestContext.run === 'function') {
-      const requestId = randomUUID();
-      return requestContext.run({ requestId }, () =>
-        this.fetchAndProcessEvents(),
-      );
+    return withSpan(
+      "indexer.poll",
+      { "indexer.contract_id": this.contractId },
+      async () => this.runPollCycle(),
+    );
+  }
+
+  /** Checkpointing only makes sense once an event contract is configured. */
+  private get checkpointsEnabled(): boolean {
+    return this.contractId.length > 0;
+  }
+
+  /**
+   * Canonical header for one ledger, or null when the RPC node cannot serve it
+   * (pruned from retention, node desynced, transient error). Public so the
+   * operator recovery path in `indexerService` can reuse it.
+   */
+  async fetchLedgerHeader(sequence: number): Promise<LedgerHeader | null> {
+    const headers = await this.fetchLedgerHeaders(sequence, sequence);
+    return headers.get(sequence) ?? null;
+  }
+
+  /**
+   * Fetch canonical headers for an inclusive ledger range.
+   *
+   * `parentHash` is derived from the previous ledger in the same response so
+   * consecutive checkpoints can be linked without decoding ledger-header XDR.
+   */
+  private async fetchLedgerHeaders(
+    startLedger: number,
+    endLedger: number,
+  ): Promise<Map<number, LedgerHeader>> {
+    const headers = new Map<number, LedgerHeader>();
+    if (endLedger < startLedger) return headers;
+
+    const PAGE_SIZE = 100;
+    let next = Math.max(0, startLedger);
+    while (next <= endLedger) {
+      const limit = Math.min(PAGE_SIZE, endLedger - next + 1);
+      const response = await this.server.getLedgers({
+        startLedger: next,
+        pagination: { limit },
+      });
+      const ledgers = response.ledgers ?? [];
+      for (const info of ledgers) {
+        headers.set(info.sequence, {
+          sequence: info.sequence,
+          hash: info.hash,
+          parentHash: extractParentLedgerHash(info),
+        });
+      }
+      const last = ledgers[ledgers.length - 1];
+      if (!last || last.sequence < next) break;
+      next = last.sequence + 1;
+    }
+    return headers;
+  }
+
+  /** Record a checkpoint for every ledger that produced events this cycle. */
+  private async recordLedgerCheckpoints(
+    processed: Map<
+      number,
+      Array<{ ledgerSequence: number; transactionHash: string; eventType: string }>
+    >,
+  ): Promise<void> {
+    if (processed.size === 0) return;
+
+    const ledgers = [...processed.keys()].sort((a, b) => a - b);
+    const min = ledgers[0]!;
+    const max = ledgers[ledgers.length - 1]!;
+
+    let headers: Map<number, LedgerHeader>;
+    try {
+      // Include one ledger below the window so the oldest checkpoint can still
+      // record a canonical parent hash.
+      headers = await this.fetchLedgerHeaders(Math.max(0, min - 1), max);
+    } catch (err) {
+      logger.warn("[SorobanWorker] Unable to fetch ledger headers for checkpoints:", err);
+      return;
     }
 
+    for (const ledger of ledgers) {
+      const header = headers.get(ledger);
+      if (!header) continue;
+      const events = processed.get(ledger)!;
+      const parentHash = header.parentHash || headers.get(ledger - 1)?.hash || '';
+      try {
+        await recordCheckpoint({
+          sequence: ledger,
+          hash: header.hash,
+          parentHash,
+          eventsCount: events.length,
+          stateRootHash: computeStateRootHash(events),
+        });
+      } catch (err) {
+        logger.warn(`[SorobanWorker] Failed to record ledger checkpoint ${ledger}:`, err);
+      }
+    }
+  }
+
+  private async runPollCycle(): Promise<void> {
     // Ensure an IndexerState row exists on first run.
-    const state = await ensureIndexerState(this.startLedger);
+    let state = await ensureIndexerState(this.startLedger);
+
+    // Pre-ingestion verification (issue #1468): before advancing the cursor,
+    // re-prove that the ledgers already checkpointed are still part of the
+    // canonical chain. A hash mismatch means an RPC failover served us a stale
+    // fork, so recover rolls every mutation above the last canonical ledger
+    // back before any new ledger is ingested.
+    if (this.checkpointsEnabled) {
+      try {
+        const recovery = await verifyAndRecover(
+          (sequence) => this.fetchLedgerHeader(sequence),
+          { alertThreshold: this.reorgAlertThreshold },
+        );
+        if (recovery.detected) {
+          logger.warn(
+            `[SorobanWorker] Reorg recovered: rolled back above ledger ` +
+              `${recovery.rollback?.safeLedger}; re-ingesting from there.`,
+          );
+          state = await ensureIndexerState(this.startLedger);
+        }
+      } catch (err) {
+        // A failure to verify is not a reorg: keep indexing forward rather than
+        // halting the pipeline on a transient RPC/DB error.
+        logger.error("[SorobanWorker] Ledger checkpoint verification failed:", err);
+      }
+    }
 
     const baseFilter = {
       filters: [
@@ -336,13 +494,35 @@ export class SorobanEventWorker {
       ? { ...baseFilter, cursor: state.lastCursor }
       : { ...baseFilter, startLedger: state.lastLedger || this.startLedger };
 
-    const response = await (this.server ? this.server.getEvents(params) : rpcPool.execute("getEvents", (server) => server.getEvents(params)));
+    const rpcStart = Date.now();
+    let response: Awaited<ReturnType<rpc.Server["getEvents"]>>;
+    try {
+      response = await this.server.getEvents(params);
+      recordRpcRequest("getEvents", (Date.now() - rpcStart) / 1000, "success");
+    } catch (err) {
+      recordRpcRequest("getEvents", (Date.now() - rpcStart) / 1000, "error");
+      indexerPollsTotal.inc({ outcome: "rpc_error" });
+      throw err;
+    }
 
-    if (response.events.length === 0) return;
+    // The network tip is reported alongside every batch, so lag is observable
+    // even on cycles that return no events.
+    const networkLedger = response.latestLedger ?? 0;
+
+    if (response.events.length === 0) {
+      indexerPollsTotal.inc({ outcome: "empty" });
+      publishIndexerLag(state.lastLedger, networkLedger);
+      return;
+    }
 
     let lastCursor: string | null = state.lastCursor;
     let lastLedger: number = state.lastLedger;
-    let hasError = false;
+    let sawSuccess = false;
+    // Successfully processed events grouped by ledger, for checkpointing.
+    const processedByLedger = new Map<
+      number,
+      Array<{ ledgerSequence: number; transactionHash: string; eventType: string }>
+    >();
 
     // Sort events so that 'stream_created' events are processed first in the batch.
     // This ensures that subsequent events (like 'fee_collected') that depend on
@@ -359,32 +539,50 @@ export class SorobanEventWorker {
       // Only process events from successful contract calls.
       if (!event.inSuccessfulContractCall) continue;
 
+      const eventType = event.topic[0] ? decodeSymbol(event.topic[0]) : "unknown";
+
       try {
         await this.processEvent(event);
         this.eventsProcessed += 1;
         this.recordOutcome(true);
-        if (!hasError) {
-          // Use the event ID as the cursor if pagingToken is not available
-          lastCursor = event.id;
-          lastLedger = event.ledger;
-        }
+        sawSuccess = true;
+        const ledgerEvents = processedByLedger.get(event.ledger) ?? [];
+        ledgerEvents.push({
+          ledgerSequence: event.ledger,
+          transactionHash: event.txHash,
+          eventType,
+        });
+        processedByLedger.set(event.ledger, ledgerEvents);
+        // Advance the cursor to the most recent event that was successfully processed.
+        // This keeps a single malformed event from pinning the entire batch forever.
+        lastCursor = event.id;
+        lastLedger = event.ledger;
+        indexerEventsProcessedTotal.inc({ eventType, result: "processed" });
       } catch (err) {
-        hasError = true;
-        this.eventsFailed += 1;
-        this.lastErrorAt = new Date();
-        this.recordOutcome(false);
+        indexerEventsProcessedTotal.inc({ eventType, result: "quarantined" });
         logger.error(
           `[SorobanWorker] Failed to process event ${event.id}:`,
           err,
         );
+        // Quarantine rather than retry inline: a payload the handler cannot
+        // parse would otherwise be re-fetched every cycle and block everything
+        // queued behind it. Operators replay it via the admin dead-letter API.
+        await quarantineEvent(event, err);
         // Continue processing subsequent events rather than halting.
       }
     }
 
-    // Use the response's final cursor if provided and no error occurred, otherwise the last valid event's ID
-    const finalCursor = hasError
-      ? lastCursor
-      : ((response as any).latestCursor || lastCursor);
+    // If we successfully processed any events in the batch, advance to the last
+    // successful event so a single poison-pill failure cannot freeze the cursor.
+    const finalCursor = sawSuccess
+      ? ((response as any).latestCursor || lastCursor)
+      : lastCursor;
+
+    // Persist a hash-signed checkpoint per ingested ledger. Best-effort: a
+    // checkpoint write failure must not stall the cursor.
+    if (this.checkpointsEnabled) {
+      await this.recordLedgerCheckpoints(processedByLedger);
+    }
 
     await prisma.indexerState.upsert({
       where: { id: INDEXER_STATE_ID },
@@ -395,6 +593,9 @@ export class SorobanEventWorker {
       },
       update: { lastLedger, lastCursor: finalCursor },
     });
+
+    indexerPollsTotal.inc({ outcome: "processed" });
+    publishIndexerLag(lastLedger, networkLedger);
 
     logger.info(
       `[SorobanWorker] Processed ${response.events.length} event(s) — latest ledger: ${lastLedger}`,
@@ -609,6 +810,13 @@ export class SorobanEventWorker {
         ? null
         : startTime + BigInt(depositedAmount) / ratePerSecondBigInt;
 
+    // Runway is how long the deposit lasts at the current rate; a zero rate
+    // never depletes. Feeds the sentinel's zero-runway flood heuristic.
+    const runwaySeconds =
+      ratePerSecondBigInt > 0n
+        ? Number(BigInt(depositedAmount) / ratePerSecondBigInt)
+        : Number.POSITIVE_INFINITY;
+
     await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       await tx.user.upsert({
         where: { publicKey: sender },
@@ -696,6 +904,23 @@ export class SorobanEventWorker {
       transactionHash: event.txHash,
       ledger: event.ledger,
     });
+
+    // Sentinel anomaly detection (#1469) is best-effort: an analysis failure
+    // must never quarantine a well-formed on-chain event.
+    try {
+      await sentinelService.recordStreamCreation({
+        sender,
+        token: tokenAddress,
+        streamId: String(streamId),
+        runwaySeconds,
+        ledger: event.ledger,
+      });
+    } catch (error) {
+      logger.warn(
+        `[SorobanWorker] Sentinel stream-creation analysis failed for #${streamId}:`,
+        error,
+      );
+    }
   }
 
   private async handleStreamToppedUp(
@@ -717,11 +942,18 @@ export class SorobanEventWorker {
       // Check for a duplicate BEFORE mutating any Stream fields so that a
       // replayed event never re-applies the top-up.
       const existingEvent = await tx.streamEvent.findUnique({
-        where: { transactionHash_eventType: { transactionHash: event.txHash, eventType: 'TOPPED_UP' } },
+        where: {
+          transactionHash_eventType: {
+            transactionHash: event.txHash,
+            eventType: "TOPPED_UP",
+          },
+        },
         select: { id: true },
       });
       if (existingEvent) {
-        logger.warn(`[SorobanWorker] Duplicate StreamEvent skipped: txHash=${event.txHash} type=TOPPED_UP`);
+        logger.warn(
+          `[SorobanWorker] Duplicate StreamEvent skipped: txHash=${event.txHash} type=TOPPED_UP`,
+        );
         return;
       }
 
@@ -739,7 +971,7 @@ export class SorobanEventWorker {
         ratePerSecondBigInt === 0n
           ? null
           : BigInt(stream.startTime) +
-            (BigInt(newDepositedAmount) / ratePerSecondBigInt) +
+            BigInt(newDepositedAmount) / ratePerSecondBigInt +
             BigInt(stream.totalPausedDuration);
 
       await tx.stream.update({
@@ -752,10 +984,15 @@ export class SorobanEventWorker {
       });
 
       await tx.streamEvent.upsert({
-        where: { transactionHash_eventType: { transactionHash: event.txHash, eventType: 'TOPPED_UP' } },
+        where: {
+          transactionHash_eventType: {
+            transactionHash: event.txHash,
+            eventType: "TOPPED_UP",
+          },
+        },
         create: {
           streamId,
-          eventType: 'TOPPED_UP',
+          eventType: "TOPPED_UP",
           amount,
           transactionHash: event.txHash,
           ledgerSequence: event.ledger,
@@ -794,22 +1031,40 @@ export class SorobanEventWorker {
     const amount = decodeI128(body["amount"]);
     const timestamp = Number(decodeU64(body["timestamp"]));
 
+    // Captured inside the transaction so the sentinel can weigh this
+    // withdrawal against the stream's total deposit once it commits.
+    let streamDeposited: string | undefined;
+    let streamToken: string | undefined;
+
     await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       // Check for a duplicate BEFORE mutating any Stream fields so that a
       // replayed event never double-increments withdrawnAmount.
       const existingEvent = await tx.streamEvent.findUnique({
-        where: { transactionHash_eventType: { transactionHash: event.txHash, eventType: 'WITHDRAWN' } },
+        where: {
+          transactionHash_eventType: {
+            transactionHash: event.txHash,
+            eventType: "WITHDRAWN",
+          },
+        },
         select: { id: true },
       });
       if (existingEvent) {
-        logger.warn(`[SorobanWorker] Duplicate StreamEvent skipped: txHash=${event.txHash} type=WITHDRAWN`);
+        logger.warn(
+          `[SorobanWorker] Duplicate StreamEvent skipped: txHash=${event.txHash} type=WITHDRAWN`,
+        );
         return;
       }
 
       const stream = await tx.stream.findUniqueOrThrow({
         where: { streamId },
-        select: { withdrawnAmount: true },
+        select: {
+          withdrawnAmount: true,
+          depositedAmount: true,
+          tokenAddress: true,
+        },
       });
+      streamDeposited = stream.depositedAmount;
+      streamToken = stream.tokenAddress;
 
       const newWithdrawnAmount = (
         BigInt(stream.withdrawnAmount) + BigInt(amount)
@@ -824,10 +1079,15 @@ export class SorobanEventWorker {
       });
 
       await tx.streamEvent.upsert({
-        where: { transactionHash_eventType: { transactionHash: event.txHash, eventType: 'WITHDRAWN' } },
+        where: {
+          transactionHash_eventType: {
+            transactionHash: event.txHash,
+            eventType: "WITHDRAWN",
+          },
+        },
         create: {
           streamId,
-          eventType: 'WITHDRAWN',
+          eventType: "WITHDRAWN",
           amount,
           transactionHash: event.txHash,
           ledgerSequence: event.ledger,
@@ -849,6 +1109,25 @@ export class SorobanEventWorker {
       ledger: event.ledger,
       timestamp,
     });
+
+    // Feed the drain sentinel (#1469). Best-effort: analysis must not
+    // quarantine a valid withdrawal event.
+    try {
+      await sentinelService.recordWithdrawal({
+        address: recipient,
+        token: streamToken ?? "unknown",
+        amount,
+        streamId: String(streamId),
+        ledger: event.ledger,
+        txHash: event.txHash,
+        ...(streamDeposited !== undefined ? { streamDeposited } : {}),
+      });
+    } catch (error) {
+      logger.warn(
+        `[SorobanWorker] Sentinel withdrawal analysis failed for #${streamId}:`,
+        error,
+      );
+    }
   }
 
   private async handleStreamCancelled(
@@ -864,7 +1143,7 @@ export class SorobanEventWorker {
 
     const amountWithdrawn = decodeI128(body["amount_withdrawn"]);
     const refundedAmount = decodeI128(body["refunded_amount"]);
-    const timestamp = Math.floor(Date.now() / 1000);
+    const timestamp = getEventLedgerTimestamp(event);
 
     await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       await tx.stream.update({
@@ -887,31 +1166,35 @@ export class SorobanEventWorker {
       });
       if (existingEvent) {
         logger.warn(
-          `[SorobanWorker] Duplicate StreamEvent skipped: txHash=${event.txHash} type=CANCELLED`,
+          `[SorobanWorker] Reconciling existing StreamEvent: txHash=${event.txHash} type=CANCELLED`,
         );
-      } else {
-        await tx.streamEvent.upsert({
-          where: {
-            transactionHash_eventType: {
-              transactionHash: event.txHash,
-              eventType: "CANCELLED",
-            },
-          },
-          create: {
-            streamId,
-            eventType: "CANCELLED",
-            amount: refundedAmount,
-            transactionHash: event.txHash,
-            ledgerSequence: event.ledger,
-            timestamp,
-            metadata: JSON.stringify({ amountWithdrawn, refundedAmount }),
-          },
-          update: {
-            ledgerSequence: event.ledger,
-            timestamp,
-          },
-        });
       }
+      await tx.streamEvent.upsert({
+        where: {
+          transactionHash_eventType: {
+            transactionHash: event.txHash,
+            eventType: "CANCELLED",
+          },
+        },
+        create: {
+          streamId,
+          eventType: "CANCELLED",
+          amount: refundedAmount,
+          transactionHash: event.txHash,
+          ledgerSequence: event.ledger,
+          timestamp,
+          metadata: JSON.stringify({ amountWithdrawn, refundedAmount }),
+        },
+        // When an API-cancelled stream already wrote a provisional CANCELLED
+        // event (issue #1219), replace the provisional fields with the
+        // authoritative ledger details from the indexed on-chain event.
+        update: {
+          ledgerSequence: event.ledger,
+          timestamp,
+          amount: refundedAmount,
+          metadata: JSON.stringify({ amountWithdrawn, refundedAmount }),
+        },
+      });
     });
 
     sseService.broadcastToStream(String(streamId), "stream.cancelled", {
@@ -937,7 +1220,7 @@ export class SorobanEventWorker {
 
     const recipient = decodeAddress(body["recipient"]);
     const totalWithdrawn = decodeI128(body["total_withdrawn"]);
-    const timestamp = Math.floor(Date.now() / 1000);
+    const timestamp = getEventLedgerTimestamp(event);
 
     await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       await tx.stream.update({
@@ -1071,7 +1354,7 @@ export class SorobanEventWorker {
 
     const sender = decodeAddress(body["sender"]);
     const pausedAt = Number(decodeU64(body["paused_at"]));
-    const timestamp = Math.floor(Date.now() / 1000);
+    const timestamp = getEventLedgerTimestamp(event);
 
     await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       await tx.stream.update({
@@ -1143,7 +1426,7 @@ export class SorobanEventWorker {
 
     const sender = decodeAddress(body["sender"]);
     const newEndTime = decodeU64(body["new_end_time"]);
-    const timestamp = Math.floor(Date.now() / 1000);
+    const timestamp = getEventLedgerTimestamp(event);
 
     await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       // Get current stream to calculate paused duration
@@ -1221,6 +1504,27 @@ export class SorobanEventWorker {
       timestamp,
     });
   }
+}
+
+/**
+ * Extract the canonical parent hash from a ledger header response.
+ *
+ * The SDK exposes the header as a parsed `LedgerHeaderHistoryEntry`; its
+ * `previousLedgerHash()` accessor is the canonical link to the ledger before
+ * it. Returns '' when the shape is unexpected so checkpointing never aborts on
+ * a cosmetic decode issue.
+ */
+function extractParentLedgerHash(info: rpc.Api.LedgerResponse): string {
+  try {
+    const entry = info.headerXdr as unknown as {
+      header?: { previousLedgerHash?: () => Buffer | Uint8Array };
+    };
+    const previous = entry?.header?.previousLedgerHash?.();
+    if (previous) return Buffer.from(previous).toString('hex');
+  } catch {
+    // Fall through to the empty hash.
+  }
+  return '';
 }
 
 export const sorobanEventWorker = new SorobanEventWorker();

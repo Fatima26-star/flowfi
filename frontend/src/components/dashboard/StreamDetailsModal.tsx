@@ -3,6 +3,7 @@
 import React from "react";
 import { Button } from "@/components/ui/Button";
 import { useModalDialog } from "@/hooks/useModalDialog";
+import { CopyButton } from "./CopyButton";
 import type { Stream } from "@/lib/dashboard";
 
 interface StreamDetailsModalProps {
@@ -61,14 +62,14 @@ export const StreamDetailsModal: React.FC<StreamDetailsModalProps> = ({
                             <label className="text-xs uppercase tracking-widest text-slate-500 font-bold mb-1 block">Recipient</label>
                             <div className="flex items-center gap-2">
                                 <code className="text-sm text-accent truncate">{stream.recipient}</code>
-                                <button
-                                    onClick={() => navigator.clipboard.writeText(stream.recipient)}
-                                    className="text-slate-500 hover:text-accent transition-colors"
-                                >
-                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-                                    </svg>
-                                </button>
+                                <CopyButton
+                                    text={stream.recipient}
+                                    label="Copy"
+                                    copiedLabel="Copied!"
+                                    ariaLabel="Copy recipient address"
+                                    copiedAriaLabel="Recipient address copied"
+                                    successMessage="Recipient address copied"
+                                />
                             </div>
                         </div>
 
