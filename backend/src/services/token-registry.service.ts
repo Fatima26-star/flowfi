@@ -71,8 +71,6 @@ export async function getTokenMetadata(address: string): Promise<TokenMetadata> 
     throw new ApiError(503, 'token_registry_unavailable', 'Token registry is temporarily unavailable');
   }
   if (existing) { await redisSet(existing); return existing; }
-  const cached = await redisGet(address);
-  if (cached) return cached;
   try {
     const [symbolValue, decimalsValue] = await Promise.all([invoke(address, 'symbol'), invoke(address, 'decimals')]);
     if (typeof symbolValue !== 'string' || !symbolValue.trim()) throw new Error('Invalid token symbol');
