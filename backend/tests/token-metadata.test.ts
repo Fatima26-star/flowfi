@@ -33,9 +33,9 @@ describe('GET /v1/tokens', () => {
   beforeEach(() => {
     resetTokenMetadata();
     registry.tokens = [
-      { id: '1', contractAddress: 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCN', symbol: 'XLM', name: 'Stellar Lumens', decimals: 7, iconUrl: null, issuerAddress: null, isVerified: true, createdAt: new Date(0), updatedAt: new Date('2026-01-01') },
-      { id: '2', contractAddress: 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA', symbol: 'USDC', name: 'USD Coin', decimals: 7, iconUrl: 'https://example.test/usdc.svg', issuerAddress: 'GISSUER', isVerified: true, createdAt: new Date(0), updatedAt: new Date('2026-01-01') },
       { id: '3', contractAddress: 'CCWAMYJME4YOIUNAKVYEBYOG5I65QMKEX2NMN4OJAPXRPIF24ONPSHY', symbol: 'EURC', name: 'Euro Coin', decimals: 7, iconUrl: null, issuerAddress: 'GISSUER2', isVerified: true, createdAt: new Date(0), updatedAt: new Date('2026-01-01') },
+      { id: '2', contractAddress: 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA', symbol: 'USDC', name: 'USD Coin', decimals: 7, iconUrl: 'https://example.test/usdc.svg', issuerAddress: 'GISSUER', isVerified: true, createdAt: new Date(0), updatedAt: new Date('2026-01-01') },
+      { id: '1', contractAddress: 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCN', symbol: 'XLM', name: 'Stellar Lumens', decimals: 7, iconUrl: null, issuerAddress: null, isVerified: true, createdAt: new Date(0), updatedAt: new Date('2026-01-01') },
     ];
   });
 
