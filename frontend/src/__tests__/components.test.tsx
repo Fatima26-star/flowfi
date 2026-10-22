@@ -148,7 +148,11 @@ describe('RecipientStep', () => {
   });
 
   it('shows validation feedback after a malformed value is edited', () => {
-    render(<RecipientStep value="" onChange={vi.fn()} />);
+    const RecipientHarness = () => {
+      const [value, setValue] = React.useState("");
+      return <RecipientStep value={value} onChange={setValue} />;
+    };
+    render(<RecipientHarness />);
     fireEvent.change(screen.getByRole('textbox'), { target: { value: 'not-a-key' } });
     expect(screen.getByRole('alert')).toHaveTextContent(/invalid stellar public key/i);
   });
