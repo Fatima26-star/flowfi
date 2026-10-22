@@ -1,4 +1,4 @@
-import { renderHook, act } from "@testing-library/react";
+import { renderHook, act, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
 import React from "react";
@@ -109,11 +109,11 @@ describe("useIncomingStreams hooks", () => {
         { wrapper, initialProps: { publicKey: "old-wallet" } },
       );
 
+      await waitFor(() => expect(resolveFirst).toBeTypeOf("function"));
       rerender({ publicKey: "new-wallet" });
-      await act(async () => {
-        await Promise.resolve();
+      await waitFor(() => {
+        expect(result.current.data?.[0]?.id).toBe("new-wallet-stream");
       });
-      expect(result.current.data?.[0]?.id).toBe("new-wallet-stream");
 
       await act(async () => {
         resolveFirst([{ id: "old-wallet-stream" } as IncomingStreamRecord]);
