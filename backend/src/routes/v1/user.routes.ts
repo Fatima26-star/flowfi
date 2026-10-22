@@ -243,10 +243,7 @@ export default router;
  *     tags:
  *       - Users
  *     summary: Export transaction history for tax and accounting
- *     description: |
- *       Generates CSV or JSON export of stream transactions for QuickBooks, Xero, CoinTracker, etc.
- *       Date bounds are optional ISO 8601 values. Malformed dates, or a startDate later than endDate,
- *       return a 400 JSON error before the download response begins.
+ *     description: Generates CSV or JSON export of stream transactions for QuickBooks, Xero, CoinTracker, etc.
  *     parameters:
  *       - in: path
  *         name: address
@@ -273,13 +270,13 @@ export default router;
  *         schema:
  *           type: string
  *           format: date-time
- *         description: Inclusive lower bound as an ISO 8601 date/time
+ *         description: Start date (ISO 8601 or Unix timestamp)
  *       - in: query
  *         name: endDate
  *         schema:
  *           type: string
  *           format: date-time
- *         description: Inclusive upper bound as an ISO 8601 date/time
+ *         description: End date (ISO 8601 or Unix timestamp)
  *       - in: query
  *         name: tokenAddress
  *         schema:
