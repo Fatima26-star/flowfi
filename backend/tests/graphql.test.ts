@@ -119,7 +119,7 @@ describe("GraphQL API", () => {
     const response = await request(app)
       .post("/graphql")
       .send({
-        query: "query { stream(streamId: 1) { id streamId sender recipient } }",
+        query: 'query { stream(streamId: "1") { id streamId sender recipient } }',
       });
 
     expect(response.status).toBe(200);
@@ -316,7 +316,7 @@ describe("GraphQL API", () => {
   describe("Issue #1699: Accept full-width stream identifiers in GraphQL schema", () => {
     it("queries stream with full-width u64 ID (> 2^31 - 1)", async () => {
       const largeStreamId = "9223372036854775807"; // 2^63 - 1
-      prismaMock.stream.findUnique.mockResolvedValueOnce({
+      prismaMock.stream.findMany.mockResolvedValueOnce([{
         id: "stream-large",
         streamId: BigInt(largeStreamId),
         sender: ADDRESS,
@@ -329,7 +329,7 @@ describe("GraphQL API", () => {
         endTime: null,
         isActive: true,
         isPaused: false,
-      });
+      }]);
 
       const response = await request(app).post("/graphql").send({
         query: `query { stream(streamId: "${largeStreamId}") { id streamId sender recipient } }`,

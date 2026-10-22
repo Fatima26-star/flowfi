@@ -764,7 +764,11 @@ describe("StreamDetailsContent claimable re-sync + pulse", () => {
     await renderStream();
 
     const firstPulse = screen.getByTestId("claimable-tick-pulse");
-    const pulse = vi.mocked(window.setInterval).mock.calls.find(([, delay]) => delay === 1000);
+    const pulse = await waitFor(() => {
+      const registeredInterval = vi.mocked(window.setInterval).mock.calls.find(([, delay]) => delay === 1000);
+      expect(registeredInterval).toBeTruthy();
+      return registeredInterval;
+    });
     expect(pulse).toBeTruthy();
 
     act(() => {
