@@ -358,7 +358,7 @@ describe('useStreamEvents', () => {
     // logger.error calls console.error — verify it was called with the
     // parse-failure label and the raw payload for debugging.
     expect(consoleSpy).toHaveBeenCalled();
-    const firstCall = consoleSpy.mock.calls[0];
+    const firstCall = consoleSpy.mock.calls[0] ?? [];
     expect(String(firstCall[0])).toContain('SSE payload parse failure');
 
     // The raw payload should appear somewhere in the logged arguments
