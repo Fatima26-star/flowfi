@@ -3,6 +3,7 @@ import {
   parseBatchCSV,
   validateEntry,
   generateSampleCSV,
+  updateBatchCSVEntry,
   formatAmount,
   type BatchStreamEntry,
 } from "@/lib/csv-parser";
@@ -93,6 +94,33 @@ GBBDIOEJGZHV5GFZQB4T7NKZQKRVNDQYXKW6Z3VJXZAVFQKZ5HM5J2EU,1000.00,2592000,0`;
       const expectedFeeUnits = BigInt(Math.round(1000 * 10 ** 7 * 250 / 10000));
       expect(result.totalProtocolFee).toBe(expectedFeeUnits);
       expect(result.totalNetDistributed).toBe(result.totalGrossAmount - result.totalProtocolFee);
+    });
+  });
+
+  describe("updateBatchCSVEntry", () => {
+    it("preserves reordered headers, extra columns, row values, and CSV escaping", () => {
+      const csv = [
+        "amount,recipient,duration_seconds,cliff_seconds,memo",
+        '1.00,GBBDIOEJGZHV5GFZQB4T7NKZQKRVNDQYXKW6Z3VJXZAVFQKZ5HM5J2EU,86400,0,"initial, ""note"""',
+        "2.00,GBCKE5YFZTPDRGGB7FSC7GBF7S4D57GZB2CZ6BHWY5G7J74D7C236M2X,172800,10,unchanged",
+      ].join("\n");
+
+      const edited = updateBatchCSVEntry(csv, 1, {
+        amount: "3.75",
+        recipient: "user@stellar.org",
+        durationSeconds: "120000",
+        cliffSeconds: "300",
+      });
+      const parsed = parseBatchCSV(edited);
+
+      expect(edited.split("\n")[0]).toBe("amount,recipient,duration_seconds,cliff_seconds,memo");
+      expect(edited).toContain('"initial, ""note"""');
+      expect(parsed.entries[0]).toMatchObject({
+        amount: "3.75", recipient: "user@stellar.org", durationSeconds: "120000", cliffSeconds: "300",
+      });
+      expect(parsed.entries[1]).toMatchObject({
+        amount: "2.00", recipient: "GBCKE5YFZTPDRGGB7FSC7GBF7S4D57GZB2CZ6BHWY5G7J74D7C236M2X", durationSeconds: "172800", cliffSeconds: "10",
+      });
     });
   });
 

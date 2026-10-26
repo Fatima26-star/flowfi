@@ -260,6 +260,44 @@ function parseCSVLine(line: string): string[] {
   return result;
 }
 
+/** Update an entry by parser row ID while preserving the file's column order and extra fields. */
+export function updateBatchCSVEntry(
+  csvContent: string,
+  entryId: number,
+  updated: Pick<BatchStreamEntry, "recipient" | "amount" | "durationSeconds" | "cliffSeconds">,
+): string {
+  const lines = csvContent.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  if (lines.length < 2 || entryId < 1 || entryId >= lines.length) {
+    throw new Error("CSV entry does not exist");
+  }
+
+  const header = parseCSVLine(lines[0] as string).map((column) => column.trim().toLowerCase());
+  const firstHeader = (...names: string[]) => names.map((name) => header.indexOf(name)).find((index) => index >= 0) ?? -1;
+  const indexes = {
+    recipient: header.indexOf("recipient"),
+    amount: header.indexOf("amount"),
+    durationSeconds: firstHeader("duration_seconds", "duration"),
+    cliffSeconds: firstHeader("cliff_seconds", "cliff"),
+  };
+  if (indexes.recipient < 0 || indexes.amount < 0 || indexes.durationSeconds < 0) {
+    throw new Error("CSV is missing a required header");
+  }
+
+  const row = parseCSVLine(lines[entryId] as string);
+  while (row.length < header.length) row.push("");
+  row[indexes.recipient] = updated.recipient;
+  row[indexes.amount] = updated.amount;
+  row[indexes.durationSeconds] = updated.durationSeconds;
+  if (indexes.cliffSeconds >= 0) row[indexes.cliffSeconds] = updated.cliffSeconds;
+
+  const serialize = (value: string) => /[",\r\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
+  lines[entryId] = row.map(serialize).join(",");
+  return lines.map((line) => {
+    const columns = parseCSVLine(line);
+    return columns.map(serialize).join(",");
+  }).join("\n");
+}
+
 /**
  * Generates a sample CSV string for download
  */

@@ -7,6 +7,7 @@ import { Stepper } from "../ui/Stepper";
 import { Button } from "../ui/Button";
 import {
   parseBatchCSV,
+  updateBatchCSVEntry,
   generateSampleCSV,
   formatAmount,
   type BatchValidationSummary,
@@ -124,19 +125,16 @@ export function BatchStreamWizard({
   const handleSaveEdit = useCallback(() => {
     if (editingEntryId === null || !validation) return;
 
-    // Update the CSV data
-    const lines = csvData.split(/\r?\n/);
-    const header = lines[0];
-    const dataLines = lines.slice(1).filter((line) => line.trim().length > 0);
-
-    if (editingEntryId > 0 && editingEntryId <= dataLines.length) {
-      dataLines[editingEntryId - 1] = `${editValues.recipient},${editValues.amount},${editValues.durationSeconds},${editValues.cliffSeconds}`;
-      const newCsv = [header, ...dataLines].join("\n");
+    try {
+      const newCsv = updateBatchCSVEntry(csvData, editingEntryId, editValues);
       setCsvData(newCsv);
 
       const result = parseBatchCSV(newCsv);
       setValidation(result);
       toast.success("Entry updated");
+    } catch (error) {
+      logger.error("Could not update batch CSV row", error);
+      toast.error("Could not update this CSV row. Check the file headers and try again.");
     }
 
     setEditingEntryId(null);
